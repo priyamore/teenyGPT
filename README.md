@@ -1,0 +1,2 @@
+# teenyGPT
+GPT from scratch
