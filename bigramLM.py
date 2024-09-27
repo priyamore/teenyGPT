@@ -6,6 +6,7 @@ from torch.nn import functional as F
 # ------------ hyperparameters ------------
 batch_size = 32 # number of sequences for parallel processing
 block_size = 8 # context length
+emb_dim = 32 # size of embedding vector, say 32 for a vocabulary of 65
 max_iters = 3000 # number of steps
 l_rate = 1e-2 
 eval_interval = 300
@@ -49,9 +50,9 @@ x_val = tokenised_out[train_w_end:]
 def get_batch(split):
     # minibatch construct
     data = x_tr if split == 'train' else x_val
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i: i + block_size] for i in ix]) # stack rows
-    y = torch.stack([data[i+1: i + (block_size+1)] for i in ix])
+    ix = torch.randint(len(data) - block_size, (batch_size,)) # high is set to len(data) - block_size so that we stay within the bounds
+    x = torch.stack([data[i: i + block_size] for i in ix]) # stack and sliced rows, shape: (32, 8)
+    y = torch.stack([data[i+1: i + (block_size+1)] for i in ix]) # stack for the next token
     x, y = x.to(device), y.to(device)
     return x, y
 # ---------------------------------------
@@ -74,16 +75,22 @@ def estimate_loss():
 
 
 class BigramLM(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
-        # store the embeddings
-        self.token_embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=vocab_size) # dict of len vocab_size with each value for vector with dim vocab_size 
-    
+        # emebedding table mapping each token to a vector
+        self.token_embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim) 
+        # positional embedding table to capture the postion of each time step
+        self.pos_embeddings = nn.Embedding(block_size, emb_dim) 
+        self.bi_lm_head = nn.Linear(emb_dim, vocab_size) #language model head
+        
+
     def forward(self, ix, target=None):
-        # forward a mini_batch of size batch_size with each tensor having context as the input 
-        # # 1. caculcate the logits
-        logits = self.token_embeddings(ix)              # B, T, C - batch, time, channel
-    
+        B, T = ix.shape
+        token_emb = self.token_embeddings(ix)                           # (B, T, C)
+        pos_emb = self.pos_embeddings(torch.arange(T, device=device))   # idx of the each time step results to (T, C) 
+        x = token_emb + pos_emb                                         # go to the position by adding pos_emb, results to (B, T, C)
+        logits = self.bi_lm_head(x) # (B, T, vocab_size)
+
         if target is not None:
             B, T, C = logits.shape
             # 2. calculate the loss - nll/cross_entropy
@@ -96,14 +103,14 @@ class BigramLM(nn.Module):
         # ix is (B, T) i.e (batch, time) => (32, 8)
         for _ in range(max_new_tokens):
             logits, _ = self(ix) # get the targets
-            logits = logits[:, -1, :] # what comes next in the sequence? the last char in the time dimension i.e context
-            probs = F.softmax(logits, dim=-1)
+            logits = logits[:, -1, :] # what comes next in the sequence? the last char in the time dimension i.e context, (B, C)
+            probs = F.softmax(logits, dim=-1) #apply softmax on the C dimension to get the probs for dim embeddings
             next_ix = torch.multinomial(probs, num_samples=1) # sampling for the next char from the dist
-            ix = torch.cat((ix, next_ix), dim=1) # running sampled indices for generating the next chars in the sequence
-        
+            ix = torch.cat((ix, next_ix), dim=1) # add the next token to  input i.e running generatio
+            
         return ix
 
-bi_model = BigramLM(vocab_size)
+bi_model = BigramLM()
 model = bi_model.to(device)
 
 # ------------ training ------------
@@ -119,7 +126,7 @@ for step in range(max_iters):
     # forward pass
     logits, loss = model(xb, yb)
     # backward pass
-    optimizer.zero_grad(set_to_none=True) # set grad= 0 from the prev steps as usual
+    optimizer.zero_grad(set_to_none=True) # set grad= 0 to clear the grads from the prev steps as usual
     loss.backward()
     # update the model params
     optimizer.step()
