@@ -6,12 +6,14 @@ from torch.nn import functional as F
 # ------------ hyperparameters ------------
 batch_size = 32 # number of sequences for parallel processing
 block_size = 8 # context length
-emb_dim = 32 # size of embedding vector, say 32 for a vocabulary of 65
-max_iters = 3000 # number of steps
-l_rate = 1e-2 
-eval_interval = 300
+emb_dim = 64 # size of embedding vector, say 32 for a vocabulary of 65
+max_iters = 5000 # number of steps
+l_rate = 1e-3 
+eval_interval = 500
 eval_iters = 200
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# num_heads = 4
+# head_size = 8
 # ------------------------------------------
 
 torch.manual_seed(1337)
@@ -73,6 +75,38 @@ def estimate_loss():
     model.train() # set the model mode back to train
     return f_out
 
+class Head(nn.Module):
+    """self-attention with a single head(communication channel)"""
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(emb_dim, head_size, bias=False)
+        self.query = nn.Linear(emb_dim, head_size, bias= False)
+        self.value = nn.Linear(emb_dim, head_size, bias= False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        K = self.key(x)
+        Q = self.query(x)
+        V = self.value(x)
+        # calculate the relevance scores i.e weights
+        weights = Q @ K.transpose(-1, -2)  * (C ** -0.5) # scaling factor - square root of the head_size 
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        weights = F.softmax(weights, dim=-1)
+        # weighted agg of V
+        f_out = weights @ V
+        return f_out
+
+class MultiHead(nn.Module):
+    """Multiple Self Attentions in Parallel"""
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        # register Heads as modules
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+    
+    def forward(self, x):
+        # concatentae the outputs from multiple attention heads over C
+        return torch.cat([head(x) for head in self.heads], dim=-1)
 
 class BigramLM(nn.Module):
     def __init__(self):
@@ -80,15 +114,17 @@ class BigramLM(nn.Module):
         # emebedding table mapping each token to a vector
         self.token_embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim) 
         # positional embedding table to capture the postion of each time step
-        self.pos_embeddings = nn.Embedding(block_size, emb_dim) 
+        self.pos_embeddings = nn.Embedding(block_size, emb_dim)
+        # self attention head
+        self.multiheads = MultiHead(8, emb_dim//8) # 4 heads with 8 dimensional SA
         self.bi_lm_head = nn.Linear(emb_dim, vocab_size) #language model head
-        
 
     def forward(self, ix, target=None):
         B, T = ix.shape
         token_emb = self.token_embeddings(ix)                           # (B, T, C)
         pos_emb = self.pos_embeddings(torch.arange(T, device=device))   # idx of the each time step results to (T, C) 
         x = token_emb + pos_emb                                         # go to the position by adding pos_emb, results to (B, T, C)
+        x = self.multiheads(x) # apply self attention
         logits = self.bi_lm_head(x) # (B, T, vocab_size)
 
         if target is not None:
@@ -102,7 +138,8 @@ class BigramLM(nn.Module):
     def generate(self, ix, max_new_tokens):
         # ix is (B, T) i.e (batch, time) => (32, 8)
         for _ in range(max_new_tokens):
-            logits, _ = self(ix) # get the targets
+            ix_cond = ix[:, -block_size:] # the ix has to be within the bounds of the time step
+            logits, _ = self(ix_cond) # get the targets
             logits = logits[:, -1, :] # what comes next in the sequence? the last char in the time dimension i.e context, (B, C)
             probs = F.softmax(logits, dim=-1) #apply softmax on the C dimension to get the probs for dim embeddings
             next_ix = torch.multinomial(probs, num_samples=1) # sampling for the next char from the dist
