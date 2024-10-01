@@ -4,16 +4,17 @@ from torch.nn import functional as F
 
 
 # ------------ hyperparameters ------------
-batch_size = 32 # number of sequences for parallel processing
-block_size = 8 # context length
-emb_dim = 64 # size of embedding vector, say 32 for a vocabulary of 65
+batch_size = 64 # number of sequences for parallel processing
+block_size = 256 # context length
+emb_dim = 384 # size of embedding vector, say 32 for a vocabulary of 65
 max_iters = 5000 # number of steps
-l_rate = 1e-3 
+l_rate = 3e-4
 eval_interval = 500
 eval_iters = 200
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-# num_heads = 4
-# head_size = 8
+num_layers = 6
+num_heads = 6
+dropout = 0.2
 # ------------------------------------------
 
 torch.manual_seed(1337)
@@ -83,6 +84,7 @@ class Head(nn.Module):
         self.query = nn.Linear(emb_dim, head_size, bias= False)
         self.value = nn.Linear(emb_dim, head_size, bias= False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -93,6 +95,7 @@ class Head(nn.Module):
         weights = Q @ K.transpose(-1, -2)  * (C ** -0.5) # scaling factor - square root of the head_size 
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)
         # weighted agg of V
         f_out = weights @ V
         return f_out
@@ -103,10 +106,51 @@ class MultiHead(nn.Module):
         super().__init__()
         # register Heads as modules
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.projection = nn.Linear(emb_dim, emb_dim)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         # concatentae the outputs from multiple attention heads over C
-        return torch.cat([head(x) for head in self.heads], dim=-1)
+        f_out = torch.cat([head(x) for head in self.heads], dim=-1)
+        f_out = self.projection(f_out)
+        f_out = self.dropout(f_out)
+        return f_out
+
+class FeedForward(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(emb_dim, 4 * emb_dim),
+            nn.ReLU(),
+        )
+        self.projection = nn.Linear(4 * emb_dim, emb_dim)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        f_out = self.network(x)
+        f_out = self.projection(f_out)
+        f_out = self.dropout(f_out)
+        return f_out
+
+class Block(nn.Module):
+    """ Transformer Block - Multiheaded Attention followed by feed forward"""
+
+    def __init__(self, emb_dim, num_heads):
+        super().__init__()
+        head_size = emb_dim // num_heads
+        # layer norm is applied before the transformation takes place(Unlike the Attention paper)
+        self.layer_norm1 = nn.LayerNorm(emb_dim)
+        self.layer_norm2 = nn.LayerNorm(emb_dim)
+        # communication
+        self.multiheads = MultiHead(num_heads=num_heads, head_size=head_size)
+        self.ffwd = FeedForward(emb_dim=emb_dim)
+        
+    def forward(self, x):
+        # add skip connections by adding input back to each layer
+        x = x + self.multiheads(self.layer_norm1(x))
+        x = x + self.ffwd(self.layer_norm2(x))
+        return x
+    
 
 class BigramLM(nn.Module):
     def __init__(self):
@@ -115,8 +159,9 @@ class BigramLM(nn.Module):
         self.token_embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim) 
         # positional embedding table to capture the postion of each time step
         self.pos_embeddings = nn.Embedding(block_size, emb_dim)
-        # self attention head
-        self.multiheads = MultiHead(8, emb_dim//8) # 4 heads with 8 dimensional SA
+        self.blocks = nn.ModuleList([Block(emb_dim, num_heads) for _ in range(num_layers)])
+        self.blocks = nn.Sequential(*self.blocks) # make sure to unpack the list
+        self.layer_norm = nn.LayerNorm(emb_dim) # final layer norm
         self.bi_lm_head = nn.Linear(emb_dim, vocab_size) #language model head
 
     def forward(self, ix, target=None):
@@ -124,7 +169,8 @@ class BigramLM(nn.Module):
         token_emb = self.token_embeddings(ix)                           # (B, T, C)
         pos_emb = self.pos_embeddings(torch.arange(T, device=device))   # idx of the each time step results to (T, C) 
         x = token_emb + pos_emb                                         # go to the position by adding pos_emb, results to (B, T, C)
-        x = self.multiheads(x) # apply self attention
+        x = self.blocks(x) # apply self attention
+        x = self.layer_norm(x)
         logits = self.bi_lm_head(x) # (B, T, vocab_size)
 
         if target is not None:
